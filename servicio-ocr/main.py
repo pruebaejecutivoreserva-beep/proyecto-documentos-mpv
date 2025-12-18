@@ -1,67 +1,64 @@
 import os
-import requests
+import json
 from flask import Flask, request, jsonify
 from google.cloud import vision
+from google.cloud import storage
+from google.cloud import pubsub_v1
 
 app = Flask(__name__)
-client = vision.ImageAnnotatorClient()
 
-# Endpoint del Servicio 2
-SQL_SERVICE_URL = "https://servicio-2-sql-v2-22596087784.europe-west1.run.app"
+# Configuración de Clientes
+vision_client = vision.ImageAnnotatorClient()
+storage_client = storage.Client()
+publisher = pubsub_v1.PublisherClient()
+
+# Configuración de entorno
+BUCKET_NAME = "documentos-mpv-storage"
+PROJECT_ID = "documentos-mpv"
+TOPIC_PATH = publisher.topic_path(PROJECT_ID, "ocr-results")
 
 @app.route("/", methods=["POST"])
 def process_ocr():
     if 'file' not in request.files:
-        return jsonify({"error": "No se recibió ningún archivo"}), 400
+        return jsonify({"error": "No se recibió archivo"}), 400
     
     file = request.files['file']
     filename = file.filename
-    content = file.read()
-    mime_type = file.content_type
     
     try:
-        # --- LÓGICA DE EXTRACCIÓN INTELIGENTE ---
-        if filename.lower().endswith('.pdf') or mime_type == 'application/pdf':
-            # Configuración para PDFs (Certificados, F30, Contratos largos)
+        # 1. SUBIR AL BUCKET (Persistencia)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(f"entradas/{filename}")
+        
+        content = file.read()
+        blob.upload_from_string(content, content_type=file.content_type)
+        gcs_uri = f"gs://{BUCKET_NAME}/entradas/{filename}"
+
+        # 2. PROCESAR OCR
+        if filename.lower().endswith('.pdf'):
             input_config = vision.InputConfig(content=content, mime_type='application/pdf')
             feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
             request_vision = vision.AnnotateFileRequest(input_config=input_config, features=[feature])
-            
-            response = client.batch_annotate_files(requests=[request_vision])
-            
-            # Consolidamos todas las páginas
-            full_text = ""
-            for page_response in response.responses[0].responses:
-                if page_response.full_text_annotation:
-                    full_text += page_response.full_text_annotation.text + "\n"
+            response = vision_client.batch_annotate_files(requests=[request_vision])
+            full_text = "\n".join([p.full_text_annotation.text for p in response.responses[0].responses if p.full_text_annotation])
         else:
-            # Configuración para Imágenes (Liquidaciones, EPP, Cursos, ODI)
             image = vision.Image(content=content)
-            response = client.document_text_detection(image=image)
+            response = vision_client.document_text_detection(image=image)
             full_text = response.full_text_annotation.text if response.full_text_annotation else ""
 
-        if not full_text.strip():
-            return jsonify({"error": "El motor no pudo extraer texto legible del archivo"}), 422
-
-        # --- PREPARACIÓN Y PERSISTENCIA ---
-        # Limpiamos el texto para evitar errores de inserción SQL
-        clean_text = full_text.replace("'", '"')
-        
+        # 3. PUBLICAR A PUB/SUB (Asíncrono)
         payload = {
-            "contenido": clean_text,
-            "archivo": filename
+            "archivo": filename,
+            "url_storage": gcs_uri,
+            "contenido": full_text.replace("'", '"')
         }
         
-        # Guardar en base de datos
-        requests.post(SQL_SERVICE_URL, json=payload, timeout=60)
-        
+        publisher.publish(TOPIC_PATH, data=json.dumps(payload).encode("utf-8"))
+
         return jsonify({
-            "status": "Procesado",
-            "metadatos": {
-                "archivo": filename,
-                "paginas_o_tipo": "Multi-página PDF" if filename.lower().endswith('.pdf') else "Imagen Única"
-            }
-        }), 200
+            "status": "Exito: Archivo guardado y procesando",
+            "bucket_path": gcs_uri
+        }), 202
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
