@@ -13,7 +13,7 @@ from extractor import extract_fields
 from config_loader import get_document_type
 
 app = Flask(__name__)
-
+print("Servicio SQL activo")
 # =========================
 # Configuración Base de Datos (ENV)
 # =========================
