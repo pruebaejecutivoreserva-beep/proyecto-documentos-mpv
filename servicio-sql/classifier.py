@@ -1,200 +1,120 @@
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
-
 from unidecode import unidecode
 from config_loader import get_all_document_types
 
 
-# =========================
-# Helpers de normalización
-# =========================
-
 def normalize_text(text: str) -> str:
     """
-    Normaliza para comparación robusta contra OCR:
-    - quita acentos
+    Normaliza para comparación:
+    - sin acentos
     - mayúsculas
     - colapsa espacios
     """
     if not text:
         return ""
-    text = unidecode(text).upper()
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    text = unidecode(text)
+    text = text.upper()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def safe_float(value: Any, default: float) -> float:
+def safe_regex_search(pattern: str, text: str) -> bool:
+    if not pattern:
+        return False
     try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def keyword_match(text_norm: str, kw_norm: str, mode: str = "word") -> bool:
-    """
-    mode:
-      - "contains": substring simple (más permisivo)
-      - "word": match por bordes (recomendado)
-    """
-    if not kw_norm:
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+    except re.error:
         return False
 
-    if mode == "contains":
-        return kw_norm in text_norm
-
-    # "word": bordes de palabra. Si kw tiene espacios, igual funciona.
-    # Ej: "LIQUIDACION DE SUELDO" -> \bLIQUIDACION\ DE\ SUELDO\b
-    pattern = r"\b" + re.escape(kw_norm) + r"\b"
-    return re.search(pattern, text_norm) is not None
-
-
-def safe_regex_search(pattern: str, text_norm: str) -> Tuple[bool, Optional[str]]:
-    """
-    Retorna (match, error). Nunca revienta.
-    """
-    if not pattern:
-        return (False, None)
-    try:
-        return (re.search(pattern, text_norm, re.IGNORECASE) is not None, None)
-    except re.error as e:
-        return (False, str(e))
-
-
-# =========================
-# Scoring configurable
-# =========================
-
-@dataclass
-class ScoringPolicy:
-    # Pesos por defecto (muy razonables para OCR real)
-    w_keyword: float = 0.20
-    w_regex_title: float = 0.60
-
-    # Umbral default si el JSON no lo trae
-    default_min_conf: float = 0.60
-
-    # Modo de matching de keywords
-    keyword_mode: str = "word"  # "word" recomendado / "contains" más permisivo
-
-    # Debug: cuántos candidatos devolver cuando no clasifica
-    debug_top_k: int = 3
-
-
-DEFAULT_POLICY = ScoringPolicy()
-
-
-def _get_policy(cfg: Dict[str, Any]) -> ScoringPolicy:
-    """
-    Permite que el JSON overridee pesos/umbral/mode si lo deseas:
-    Dentro de "clasificacion":
-      - peso_keyword
-      - peso_regex_titulo
-      - confianza_minima
-      - keyword_mode  ("word" | "contains")
-    """
-    clasif = cfg.get("clasificacion", {}) if isinstance(cfg, dict) else {}
-
-    return ScoringPolicy(
-        w_keyword=safe_float(clasif.get("peso_keyword"), DEFAULT_POLICY.w_keyword),
-        w_regex_title=safe_float(clasif.get("peso_regex_titulo"), DEFAULT_POLICY.w_regex_title),
-        default_min_conf=safe_float(clasif.get("confianza_minima"), DEFAULT_POLICY.default_min_conf),
-        keyword_mode=str(clasif.get("keyword_mode") or DEFAULT_POLICY.keyword_mode).strip().lower(),
-        debug_top_k=DEFAULT_POLICY.debug_top_k
-    )
-
-
-# =========================
-# Clasificador principal
-# =========================
 
 def classify_document(ocr_text: str):
     """
-    Devuelve (tipo_documento, confianza, metodo, detalles)
+    Devuelve: (tipo_documento, confianza, metodo, detalles)
 
-    - Usa reglas por tipo: keywords + regex_titulo.
-    - Score configurable desde JSON.
-    - Devuelve debug útil si no clasifica.
+    Mejoras:
+    - Confianza basada en:
+      * proporción de keywords encontradas (no solo suma fija)
+      * bonus por regex de título
+      * (opcional) bonus por "señales" extra si las agregas en config
+    - Si no alcanza confianza_minima, aún puede devolver el "mejor candidato"
+      como BAJA_CONFIANZA (útil para debug y para no quedar siempre en DESCONOCIDO).
     """
-    text_norm = normalize_text(ocr_text)
-    doc_types = get_all_document_types() or {}
+    text = normalize_text(ocr_text)
+    doc_types = get_all_document_types()
 
     best_type = "DESCONOCIDO"
     best_score = 0.0
-    best_details: Dict[str, Any] = {"matches": []}
-
-    ranking: List[Dict[str, Any]] = []
+    best_details = {"matches": [], "confianza_minima": None}
 
     for type_id, cfg in doc_types.items():
-        if not isinstance(cfg, dict):
-            continue
-        if str(type_id).strip().upper() == "DESCONOCIDO":
+        if type_id == "DESCONOCIDO":
             continue
 
         clasif = cfg.get("clasificacion", {})
-        if not isinstance(clasif, dict):
-            clasif = {}
-
-        policy = _get_policy(cfg)
-
         keywords = clasif.get("palabras_clave", []) or []
-        if not isinstance(keywords, list):
-            keywords = []
+        regex_title = clasif.get("regex_titulo", "") or ""
+        min_conf = float(clasif.get("confianza_minima", 0.8))
 
-        regex_title = str(clasif.get("regex_titulo") or "").strip()
-        min_conf = policy.default_min_conf
+        # Pesos configurables (si no vienen, usamos defaults buenos)
+        pesos = clasif.get("pesos", {}) or {}
+        w_keywords = float(pesos.get("keywords", 0.55))   # peso total máximo por keywords
+        w_regex = float(pesos.get("regex_titulo", 0.45))  # bonus por regex
 
+        matches = []
         score = 0.0
-        matches: List[Dict[str, Any]] = []
 
-        # ---- Keywords ----
+        # 1) Keywords: usamos proporción (en vez de +0.15 por cada una)
+        kw_norms = []
         for kw in keywords:
-            kw_norm = normalize_text(str(kw))
-            if keyword_match(text_norm, kw_norm, mode=policy.keyword_mode):
-                score += policy.w_keyword
-                matches.append({"tipo": "keyword", "valor": str(kw)})
+            kwn = normalize_text(str(kw))
+            if kwn:
+                kw_norms.append((kw, kwn))
 
-        # ---- Regex título ----
+        found = 0
+        for raw_kw, kw_n in kw_norms:
+            if kw_n in text:
+                found += 1
+                matches.append({"tipo": "keyword", "valor": raw_kw})
+
+        if kw_norms:
+            ratio = found / max(1, len(kw_norms))
+            score += w_keywords * ratio  # 0..w_keywords
+
+        # 2) Regex título
         if regex_title:
-            ok, err = safe_regex_search(regex_title, text_norm)
-            if ok:
-                score += policy.w_regex_title
+            if safe_regex_search(regex_title, text):
+                score += w_regex
                 matches.append({"tipo": "regex_titulo", "valor": regex_title})
-            elif err:
-                matches.append({"tipo": "regex_error", "valor": f"{regex_title} | {err}"})
+            else:
+                # si el regex viene malo, lo marcamos (sin romper)
+                try:
+                    re.compile(regex_title)
+                except re.error:
+                    matches.append({"tipo": "regex_error", "valor": regex_title})
 
-        confianza = min(1.0, score)
+        confianza = max(0.0, min(1.0, score))
 
-        ranking.append({
-            "tipo_documento": str(type_id),
-            "score": confianza,
-            "confianza_minima": min_conf,
-            "policy": {
-                "w_keyword": policy.w_keyword,
-                "w_regex_titulo": policy.w_regex_title,
-                "keyword_mode": policy.keyword_mode
-            },
-            "matches": matches
-        })
-
-        if confianza >= min_conf and confianza > best_score:
+        # Nos quedamos con el mejor SIEMPRE (para debug)
+        if confianza > best_score:
             best_score = confianza
-            best_type = str(type_id)
+            best_type = type_id
             best_details = {
                 "matches": matches,
                 "confianza_minima": min_conf,
-                "policy": {
-                    "w_keyword": policy.w_keyword,
-                    "w_regex_titulo": policy.w_regex_title,
-                    "keyword_mode": policy.keyword_mode
-                }
+                "score": round(confianza, 4),
+                "keywords_found": found,
+                "keywords_total": len(kw_norms),
             }
 
-    # Si no clasificó: devolver debug con top candidatos
-    if best_type == "DESCONOCIDO":
-        top = sorted(ranking, key=lambda x: x["score"], reverse=True)[:DEFAULT_POLICY.debug_top_k]
-        return ("DESCONOCIDO", 0.0, "REGLAS", {"top_candidatos": top})
+    # --- Política de salida ---
+    # Si no hay nada, DESCONOCIDO
+    if best_score <= 0.0:
+        return ("DESCONOCIDO", 0.0, "REGLAS", {"matches": []})
+
+    # Si el mejor candidato no alcanza su umbral, devolvemos BAJA_CONFIANZA
+    # (Si prefieres la lógica antigua, cambia esto por DESCONOCIDO)
+    min_conf_best = best_details.get("confianza_minima") or 0.8
+    if best_score < float(min_conf_best):
+        return (best_type, best_score, "REGLAS_BAJA_CONFIANZA", best_details)
 
     return (best_type, best_score, "REGLAS", best_details)
