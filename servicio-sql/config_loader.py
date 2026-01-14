@@ -4,8 +4,7 @@ import os
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 
 # Ruta al directorio config/document_types del repo
-CONFIG_PATH = os.path.abspath(os.path.join(BASE_PATH, "..", "config", "document_types"))
-
+CONFIG_PATH = os.path.join(BASE_PATH, "config", "document_types")
 
 def load_document_types():
     """
