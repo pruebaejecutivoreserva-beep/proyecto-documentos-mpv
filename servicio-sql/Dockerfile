@@ -6,6 +6,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-COPY ../config /config
+COPY config /app/config
 
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
